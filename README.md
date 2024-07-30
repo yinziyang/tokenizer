@@ -21,15 +21,16 @@ tokenizer.save_pretrained(TOKENIZER_PATH, legacy_format=False)
 package main
 
 import (
-    "github.com/yinziyang/tokenizer"
     "fmt"
+    "os"
+
+    "github.com/yinziyang/tokenizer"
 )
 
 const TOKENIZER_PATH = "tokenizer.json"
 const MAX_LENGTH = 500
 const NEED_PAD = false
 const ADD_SPECIAL_TOKENS = true
-
 
 func main() {
     tk, err := tokenizer.FromFile(TOKENIZER_PATH)
@@ -38,6 +39,12 @@ func main() {
     }
     defer tk.Close()
 
-    fmt.Printf("%#v\n", tk.EncodeWithOptions(os.Args[1], MAX_LENGTH, NEED_PAD, ADD_SPECIAL_TOKENS, tokenizer.WithReturnAllAttributes()))
+    fmt.Printf("%+v\n", tk.EncodeWithOptions(os.Args[1], MAX_LENGTH, NEED_PAD, ADD_SPECIAL_TOKENS, tokenizer.WithReturnAllAttributes()))
 }
+```
+
+```sh
+go run tokenizer.go "测试一下"
+
+{IDs:[101 4988 7333 2072 2079 102] TypeIDs:[0 0 0 0 0 0] SpecialTokensMask:[1 0 0 0 0 1] AttentionMask:[1 1 1 1 1 1] Tokens:[[CLS] 测 试 一 下 [SEP]]}
 ```
