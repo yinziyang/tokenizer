@@ -1,9 +1,8 @@
 package tokenizer
 
-// TODO packaging: how do we build the rust lib for distribution?
-
 /*
-#cgo LDFLAGS: -ltokenizers -ldl -lm -lstdc++
+#cgo CFLAGS: -I.
+#cgo LDFLAGS: -L./ -ltokenizers -ldl -lm -lstdc++ -O3
 #include <stdlib.h>
 #include "tokenizers.h"
 */
@@ -14,6 +13,8 @@ import (
 	"io"
 	"unsafe"
 )
+
+var maxKeepLength = 20 * 512
 
 type Tokenizer struct {
 	tokenizer unsafe.Pointer
@@ -81,6 +82,14 @@ type Encoding struct {
 	Tokens            []string
 }
 
+func (e *Encoding) Reset() {
+	e.AttentionMask = e.AttentionMask[:0]
+	e.IDs = e.IDs[:0]
+	e.SpecialTokensMask = e.SpecialTokensMask[:0]
+	e.Tokens = e.Tokens[:0]
+	e.TypeIDs = e.TypeIDs[:0]
+}
+
 type encodeOpts struct {
 	AddSpecialTokens C.bool
 
@@ -92,16 +101,36 @@ type encodeOpts struct {
 
 type EncodeOption func(eo *encodeOpts)
 
-func uintVecToSlice(arrPtr *C.uint, len int) []uint32 {
-	arr := unsafe.Slice(arrPtr, len)
-	slice := make([]uint32, len)
+func uintVecToSlice(arrPtr *C.uint, length int) []uint32 {
+	if arrPtr == nil || length <= 0 {
+		return nil
+	}
+	arr := unsafe.Slice(arrPtr, length)
+	slice := make([]uint32, length)
 	for i, v := range arr {
 		slice[i] = uint32(v)
 	}
 	return slice
 }
 
-func (t *Tokenizer) Encode(str string, maxLen int, needPad bool, addSpecialTokens bool) ([]uint32, []string) {
+func stringVecToSlice(arrPtr *C.char, length int) []string {
+	if arrPtr == nil || length <= 0 {
+		return nil
+	}
+	arr := unsafe.Slice((**C.char)(unsafe.Pointer(arrPtr)), length)
+	slice := make([]string, length)
+	for i, v := range arr {
+		if v != nil {
+			slice[i] = C.GoString(v)
+		} else {
+			slice[i] = ""
+		}
+	}
+
+	return slice
+}
+
+func (t *Tokenizer) Encode(str string, addSpecialTokens bool) ([]uint32, []string) {
 	cStr := C.CString(str)
 	defer C.free(unsafe.Pointer(cStr))
 	options := encodeOpts{
@@ -109,50 +138,19 @@ func (t *Tokenizer) Encode(str string, maxLen int, needPad bool, addSpecialToken
 		ReturnTokens:     C.bool(true),
 	}
 	res := C.encode(t.tokenizer, cStr, (*C.struct_EncodeOptions)(unsafe.Pointer(&options)))
-	resLen := int(res.len)
-	if resLen == 0 {
+	defer C.free_buffer(res)
+	length := int(res.len)
+	if length == 0 {
 		return nil, nil
 	}
-	defer C.free_buffer(res)
 
-	ids := uintVecToSlice(res.ids, resLen)
+	ids := uintVecToSlice(res.ids, length)
 
 	var tokens []string
 	if res.tokens != nil {
-		tokens = make([]string, resLen)
-		for i, s := range (*[1 << 30]*C.char)(unsafe.Pointer(res.tokens))[:resLen:resLen] {
-			tokens[i] = C.GoString(s)
-		}
+		tokens = stringVecToSlice(res.tokens, length)
 	}
-	var finalIds []uint32
-	var finalTokens []string
-	var tokenLen = len(tokens)
-	if tokenLen > maxLen {
-		if addSpecialTokens {
-			finalIds = append(finalIds, ids[0])
-			finalIds = append(finalIds, ids[1:maxLen-1]...)
-			finalIds = append(finalIds, ids[tokenLen-1])
-
-			finalTokens = append(finalTokens, tokens[0])
-			finalTokens = append(finalTokens, tokens[1:maxLen-1]...)
-			finalTokens = append(finalTokens, tokens[tokenLen-1])
-		} else {
-			finalIds = append(finalIds, ids[:maxLen]...)
-			finalTokens = append(finalTokens, tokens[:maxLen]...)
-		}
-	} else if tokenLen < maxLen && needPad {
-		finalIds = append(finalIds, ids...)
-		finalTokens = append(finalTokens, tokens...)
-		for len(finalTokens) < maxLen {
-			finalIds = append(finalIds, 0)
-			finalTokens = append(finalTokens, "[PAD]")
-		}
-	} else {
-		finalIds = append(finalIds, ids...)
-		finalTokens = append(finalTokens, tokens...)
-	}
-
-	return finalIds, finalTokens
+	return ids, tokens
 }
 
 func WithReturnAllAttributes() EncodeOption {
@@ -188,7 +186,10 @@ func WithReturnAttentionMask() EncodeOption {
 	}
 }
 
-func (t *Tokenizer) EncodeWithOptions(str string, maxLen int, needPad bool, addSpecialTokens bool, opts ...EncodeOption) Encoding {
+func (t *Tokenizer) EncodeWithOptions(str string, addSpecialTokens bool, opts ...EncodeOption) *Encoding {
+	if len(str) > maxKeepLength {
+		str = t.TruncateString(str, uint(maxKeepLength))
+	}
 	cStr := C.CString(str)
 	defer C.free(unsafe.Pointer(cStr))
 
@@ -200,113 +201,52 @@ func (t *Tokenizer) EncodeWithOptions(str string, maxLen int, needPad bool, addS
 	}
 
 	res := C.encode(t.tokenizer, cStr, (*C.struct_EncodeOptions)(unsafe.Pointer(&encOptions)))
-	resLen := int(res.len)
-	if resLen == 0 {
-		return Encoding{}
-	}
 	defer C.free_buffer(res)
+	length := int(res.len)
+	if length == 0 {
+		return &Encoding{}
+	}
 
 	encoding := Encoding{}
-	encoding.IDs = uintVecToSlice(res.ids, resLen)
+	encoding.IDs = uintVecToSlice(res.ids, length)
 
 	if encOptions.ReturnTypeIDs && res.type_ids != nil {
-		encoding.TypeIDs = uintVecToSlice(res.type_ids, resLen)
+		encoding.TypeIDs = uintVecToSlice(res.type_ids, length)
 	}
 
 	if encOptions.ReturnTokens && res.tokens != nil {
-		tokens := make([]string, resLen)
-		for i, s := range (*[1 << 30]*C.char)(unsafe.Pointer(res.tokens))[:resLen:resLen] {
-			tokens[i] = C.GoString(s)
-		}
-		encoding.Tokens = tokens
+		encoding.Tokens = stringVecToSlice(res.tokens, length)
 	}
 
 	if encOptions.ReturnSpecialTokensMask && res.special_tokens_mask != nil {
-		encoding.SpecialTokensMask = uintVecToSlice(res.special_tokens_mask, resLen)
+		encoding.SpecialTokensMask = uintVecToSlice(res.special_tokens_mask, length)
 	}
 
 	if encOptions.ReturnAttentionMask && res.attention_mask != nil {
-		encoding.AttentionMask = uintVecToSlice(res.attention_mask, resLen)
+		encoding.AttentionMask = uintVecToSlice(res.attention_mask, length)
 	}
 
-	var finalIds []uint32
-	var finalTokens []string
-	var finalSpecialTokensMask []uint32
-	var finalAttentionMask []uint32
-	var finalTypeIds []uint32
-
-	var ids = encoding.IDs
-	var tokens = encoding.Tokens
-	var specialTokensMask = encoding.SpecialTokensMask
-	var attentionMask = encoding.AttentionMask
-	var typeIds = encoding.TypeIDs
-
-	var tokenLen = len(tokens)
-	if tokenLen > maxLen {
-		if addSpecialTokens {
-			finalIds = append(finalIds, ids[0])
-			finalIds = append(finalIds, ids[1:maxLen-1]...)
-			finalIds = append(finalIds, ids[tokenLen-1])
-
-			finalTokens = append(finalTokens, tokens[0])
-			finalTokens = append(finalTokens, tokens[1:maxLen-1]...)
-			finalTokens = append(finalTokens, tokens[tokenLen-1])
-
-			finalSpecialTokensMask = append(finalSpecialTokensMask, specialTokensMask[0])
-			finalSpecialTokensMask = append(finalSpecialTokensMask, specialTokensMask[1:maxLen-1]...)
-			finalSpecialTokensMask = append(finalSpecialTokensMask, specialTokensMask[tokenLen-1])
-
-			finalAttentionMask = append(finalAttentionMask, attentionMask[:maxLen]...)
-
-			finalTypeIds = append(finalTypeIds, typeIds[:maxLen]...)
-		} else {
-			finalIds = append(finalIds, ids[:maxLen]...)
-			finalTokens = append(finalTokens, tokens[:maxLen]...)
-			finalSpecialTokensMask = append(finalSpecialTokensMask, specialTokensMask[:maxLen]...)
-			finalAttentionMask = append(finalAttentionMask, attentionMask[:maxLen]...)
-			finalTypeIds = append(finalTypeIds, typeIds[:maxLen]...)
-		}
-
-	} else if tokenLen < maxLen && needPad {
-		finalIds = append(finalIds, ids...)
-		finalTokens = append(finalTokens, tokens...)
-		finalSpecialTokensMask = append(finalSpecialTokensMask, specialTokensMask...)
-		finalAttentionMask = append(finalAttentionMask, attentionMask...)
-		finalTypeIds = append(finalTypeIds, typeIds...)
-		for len(finalTokens) < maxLen {
-			finalIds = append(finalIds, 0)
-			finalTokens = append(finalTokens, "[PAD]")
-			finalSpecialTokensMask = append(finalSpecialTokensMask, 1)
-			finalAttentionMask = append(finalAttentionMask, 0)
-			finalTypeIds = append(finalTypeIds, 0)
-		}
-	} else {
-		finalIds = append(finalIds, ids...)
-		finalTokens = append(finalTokens, tokens...)
-		finalSpecialTokensMask = append(finalSpecialTokensMask, specialTokensMask...)
-		finalAttentionMask = append(finalAttentionMask, attentionMask...)
-		finalTypeIds = append(finalTypeIds, typeIds...)
-	}
-
-	encoding.IDs = finalIds
-	encoding.Tokens = finalTokens
-	encoding.SpecialTokensMask = finalSpecialTokensMask
-	encoding.AttentionMask = finalAttentionMask
-	encoding.TypeIDs = finalTypeIds
-
-	return encoding
+	return &encoding
 }
 
 func (t *Tokenizer) Decode(tokenIDs []uint32, skipSpecialTokens bool) string {
 	if len(tokenIDs) == 0 {
 		return ""
 	}
-	len := C.uint(len(tokenIDs))
-	res := C.decode(t.tokenizer, (*C.uint)(unsafe.Pointer(&tokenIDs[0])), len, C.bool(skipSpecialTokens))
+	length := C.uint(len(tokenIDs))
+	res := C.decode(t.tokenizer, (*C.uint)(unsafe.Pointer(&tokenIDs[0])), length, C.bool(skipSpecialTokens))
 	defer C.free_string(res)
 	return C.GoString(res)
 }
 
 func (t *Tokenizer) VocabSize() uint32 {
 	return uint32(C.vocab_size(t.tokenizer))
+}
+
+func (t *Tokenizer) TruncateString(message string, keepsize uint) string {
+	cMessage := C.CString(message)
+	defer C.free(unsafe.Pointer(cMessage))
+	cResult := C.truncate_string(cMessage, C.uint(keepsize))
+	defer C.free_string(cResult)
+	return C.GoString(cResult)
 }
